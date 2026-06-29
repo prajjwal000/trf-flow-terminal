@@ -1,6 +1,6 @@
 # TRF Flow Terminal
 
-Serverless full-stack application that aggregates, classifies, and replays institutional equity trade data — contrasting lit-exchange volume against off-exchange (dark pool / TRF) activity across multiple tickers simultaneously.
+Serverless full-stack application that aggregates, classifies, and replays institutional equity trade data — contrasting lit-exchange volume against off-exchange activity across multiple tickers simultaneously, with three-way flow classification separating retail internalization from institutional dark pool prints.
 
 **Data pipeline:** Alpaca SIP (15-min delayed) → Go Lambda (fetch + classify + bucket) → React (Virtual Clock replay + treemap visualization)
 
@@ -8,17 +8,35 @@ Serverless full-stack application that aggregates, classifies, and replays insti
 
 ## 1. System Overview
 
-Fetches historical tick-level trade data from Alpaca's free-tier SIP consolidated tape feed. Classifies each trade as lit exchange or off-exchange TRF print (exchange codes `D`/`E` = dark pool). Aggregates into 1-minute volume buckets per symbol. Returns compressed JSON to a React frontend that replays via a synchronized Virtual Clock engine — no WebSocket needed.
+Fetches historical tick-level trade data from Alpaca's free-tier SIP consolidated tape feed. Classifies each trade across three flow categories: lit exchange, retail internalized (off-exchange PFOF wholesaler flow), and institutional dark pool (genuine dark pool prints and block trades). Aggregates into 1-minute volume buckets per symbol. Returns compressed JSON to a React frontend that replays via a synchronized Virtual Clock engine — no WebSocket needed.
 
 The 15-minute SIP delay is irrelevant: the frontend replays data, not streams live. Users experience the session as a controllable replay at 1x, 5x, or 10x speed.
 
-### Dark Pool Classification
+### Flow Classification
 
-Two-layer classifier using the `marketdata.Trade` struct (`Exchange`, `Conditions`, `Tape`). Layer 1: definitive TRF check via exchange code (`D` = FINRA ADF, `E` = Market Independent). Layer 2: condition code confidence scoring (CTS spec for Tape A/B, UTDF spec for Tape C). Combined output gives `IsDarkPool` + `ConfidenceScore` (0–3) per trade.
+Each trade is classified using two independent heuristics applied in sequence:
 
-> **Limitation:** My current approach equates all TRF (dark pool) volume with institutional activity. This is naive — dark pools serve both institutions executing block trades and retail wholesalers internalizing order flow. Differentiating retail vs institutional dark volume is an open research problem. I plan to address this using order flow normalization and limit order book microstructure analysis. Relevant literature: [Briola et al. (2024) — Deep Limit Order Book Forecasting](https://arxiv.org/abs/2403.09267) connects a stock's microstructural properties to its predictability, providing a framework for classifying trade types based on LOB signatures. [Kang (2025) — Optimal Signal Extraction from Order Flow](https://arxiv.org/abs/2512.18648) shows that market-cap normalization acts as a matched filter for informed vs noise trader signals, achieving 1.3–1.9× higher correlation with returns than volume-based normalization. Both are promising directions for a more sophisticated classifier in a future iteration.
+**Step 1 — Exchange code (lit vs. off-exchange):**
+Exchange codes `D` (FINRA ADF) and `E` (Market Independent) are off-exchange. All other codes are lit. This is definitive — FINRA TRF rules require all off-exchange trades to be reported through `D` or `E`.
 
-FINRA ATS weekly reports are ingested via cron Lambda and stored in S3. Each symbol is enriched with a **Dark Pool Tendency Score** — 4-week trailing average % off-exchange volume — providing historical context the real-time feed cannot give.
+**Step 2 — Sub-penny tick filter (retail vs. institutional, off-exchange only):**
+Retail wholesalers (Citadel, Virtu, Susquehanna, etc.) are required by FINRA to provide sub-penny price improvement over NBBO. This means internalized retail prints arrive at fractional-cent prices (e.g., `$185.3214`), while institutional dark pool prints execute at NBBO or mid-point — always at penny or half-penny boundaries (`$185.32`, `$185.325`). Any off-exchange print where `price mod $0.01` has a nonzero fractional-cent component is classified as retail internalized.
+
+**Step 3 — Notional size tier (institutional prints only):**
+Off-exchange penny-tick prints are further bucketed by notional value (`price × shares`):
+
+| Tier | Notional | Label |
+|---|---|---|
+| `dark_retail` | — | Sub-penny tick; retail internalization |
+| `dark_inst_small` | < $1M | Penny tick; smaller institutional / ambiguous |
+| `dark_inst_mid` | $1M–$10M | Mid-size institutional |
+| `dark_inst_block` | > $10M | Large block; primary institutional signal |
+
+> **Why this matters:** The naive lit/dark binary overstates institutional dark pool activity. A large fraction of off-exchange volume is PFOF retail internalization with no informational content about institutional positioning. The three-way split surfaces the signal underneath.
+
+FINRA ATS weekly reports are ingested via cron Lambda and stored in S3. Each symbol is enriched with a **Dark Pool Tendency Score** — 4-week trailing average % *institutional* off-exchange volume (retail internalization excluded) — providing historical context the real-time feed cannot give.
+
+> **Limitation:** The sub-penny tick filter correctly classifies the bulk of retail internalization but is not perfect. A small fraction of institutional algorithmic orders (e.g., peg orders with sub-penny improvement) may be miscategorized as retail. Distinguishing these with higher confidence requires MPID-level data not available in the free SIP tier and will be addressed in a future iteration.
 
 ---
 
@@ -35,15 +53,15 @@ FINRA ATS weekly reports are ingested via cron Lambda and stored in S3. Each sym
 │  │  requestAnimationFrame  │───▶│  Treemap (Canvas GPU-accel)   │   │
 │  │  Playback: 1x / 5x / 10x│    │  Grid/Bento per-ticker cells │   │
 │  │  Immutable data ref     │    │  Sized by total volume        │   │
-│  │  Single global timeline │    │  Colored by dark pool % dev.  │   │
-│  └─────────────────────────┘    │  Leaderboard mode (deviation)  │   │
+│  │  Single global timeline │    │  Colored by inst. dark % dev. │   │
+│  └─────────────────────────┘    │  Leaderboard mode (deviation) │   │
 │                                 │                               │   │
 │  ┌─────────────────────────┐    │  Detail card on click:        │   │
-│  │   Incremental Polling   │    │  Sparkline, running total,    │   │
-│  │                         │    │  notable prints audit log     │   │
-│  │  GET /api/replay?token=X│    └───────────────────────────────┘   │
-│  │  Exponential backoff    │                                         │
-│  └─────────────────────────┘                                         │
+│  │   Incremental Polling   │    │  Stacked sparkline (lit /     │   │
+│  │                         │    │  dark_retail / dark_inst),    │   │
+│  │  GET /api/replay?token=X│    │  running totals, block print  │   │
+│  │  Exponential backoff    │    │  audit log                    │   │
+│  └─────────────────────────┘    └───────────────────────────────┘   │
 └──────────────────────┬───────────────────────────────────────────────┘
                        │
                        │  GET /api/replay?tickers=AAPL,SPY,NVDA&hours=2
@@ -66,17 +84,20 @@ FINRA ATS weekly reports are ingested via cron Lambda and stored in S3. Each sym
 │  2. Alpaca SDK GetMultiTradesAsync (concurrent, token-bucket         │
 │     rate-limited to 200 req/min)                                     │
 │                                                                      │
-│  3. MapReduce: drain channel, classify each trade, bucket by         │
-│     (symbol, minute_epoch, lit|dark)                                 │
+│  3. MapReduce: drain channel → classify each trade (exchange code    │
+│     → sub-penny tick filter → notional tier) → bucket by            │
+│     (symbol, epoch_ms, lit|dark_retail|dark_inst_*) at             │
+│     adaptive resolution (0.5s / 1s / 5s per window length)         │
 │                                                                      │
-│  4. FINRA ATS enrichment via S3 lookup                               │
+│  4. FINRA ATS enrichment via S3 lookup (tendency score uses          │
+│     institutional dark only, retail internalization excluded)        │
 │                                                                      │
-│  5. Write first minute to S3 staging → return { status:"partial"}    │
-│     Client polls with exponential backoff for remaining chunks       │
+│  5. Write first 30s of buckets to S3 staging → return            │
+│     { status:"partial"} Client polls with exponential backoff     │
 │                                                                      │
 │  6. On completion: promote staging → final cache entry               │
 │                                                                      │
-│  7. Payload guard: truncate at 9MB if over limit                     │
+│  7. Payload guard: truncate at 5.5MB per chunk if over limit         │
 └──────────────────────┬───────────────────────────────────────────────┘
                        ▼
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -101,83 +122,237 @@ FINRA ATS weekly reports are ingested via cron Lambda and stored in S3. Each sym
 
 ## 3. Data Flow
 
-### 3.1 Cache Design
+### 3.1 Trade Classification (MapReduce Step)
 
-The Lambda uses the **AWS SDK for Go** (`github.com/aws/aws-sdk-go-v2/service/s3`) to talk to S3 over HTTPS. IAM policy grants `s3:GetObject` + `s3:PutObject` on the cache bucket only. The SDK auto-discovers credentials from the Lambda execution environment — no manual auth setup.
+The classifier runs per-trade in the MapReduce drain loop before bucketing. Classification is a pure function with no external calls:
 
-**Cache keys are normalized to hour boundaries** so overlapping requests share cache entries:
+```go
+type FlowClass int
+
+const (
+    Lit                FlowClass = iota
+    DarkRetail                          // off-exchange, sub-penny tick
+    DarkInstitutionalSmall              // off-exchange, penny tick, notional < $1M
+    DarkInstitutionalMid                // off-exchange, penny tick, $1M–$10M
+    DarkInstitutionalBlock              // off-exchange, penny tick, > $10M
+)
+
+func classifyTrade(t Trade) FlowClass {
+    // Step 1: exchange code
+    if t.Exchange != "D" && t.Exchange != "E" {
+        return Lit
+    }
+
+    // Step 2: sub-penny tick filter
+    fractionalCent := math.Mod(t.Price*100, 1.0)
+    if fractionalCent > 0.001 && fractionalCent < 0.999 {
+        return DarkRetail
+    }
+
+    // Step 3: notional size tier
+    notional := t.Price * float64(t.Size)
+    switch {
+    case notional >= 10_000_000:
+        return DarkInstitutionalBlock
+    case notional >= 1_000_000:
+        return DarkInstitutionalMid
+    default:
+        return DarkInstitutionalSmall
+    }
+}
+```
+
+### 3.2 Bucket Schema and Adaptive Resolution
+
+Buckets are sub-minute to make the Virtual Clock replay feel fluid. The bucket size is selected at request time based on the requested window, keeping the total bucket count — and therefore chunk sizes and payload — manageable regardless of session length:
+
+| Window | Bucket size | Buckets per hour | Buckets per max window |
+|---|---|---|---|
+| ≤ 2 hours | 0.5 seconds | 7,200 | 14,400 |
+| 2–4 hours | 1 second | 3,600 | 14,400 |
+| 4–8 hours | 5 seconds | 720 | 23,040 |
+
+The bucket size is determined once at the start of the Lambda invocation and held constant for all tickers in the request. It is included in the cache key (see section 3.4) so different window lengths never share cache entries.
+
+Each bucket carries five volume fields. The frontend consumes all five; the treemap coloring and tendency score use only the institutional fields.
+
+```go
+type Bucket struct {
+    Epoch          int64  `json:"t"`    // Unix timestamp, start of bucket (milliseconds)
+    BucketMs       int64  `json:"bms"` // bucket duration in milliseconds (500, 1000, or 5000)
+    LitVol         int64  `json:"lv"`  // lit exchange volume
+    DarkRetailVol  int64  `json:"drv"` // retail internalization volume
+    DarkInstVol    int64  `json:"div"` // institutional dark (all tiers)
+    DarkBlockVol   int64  `json:"dbv"` // block prints only (> $10M notional)
+    DarkBlockCount int    `json:"dbc"` // number of block prints (for audit log)
+}
+```
+
+`BucketMs` is included in every bucket so the frontend Virtual Clock can compute inter-bucket timing correctly without needing to know the global bucket size separately. `DarkInstVol` is the sum of `DarkInstitutionalSmall + Mid + Block`. `DarkBlockVol` is a subset of `DarkInstVol` surfaced separately for the audit log.
+
+### 3.3 Tendency Score — Computation and Fallback Hierarchy
+
+The FINRA ATS cron Lambda computes the 4-week trailing tendency score. The score is calculated as:
 
 ```
-cache/{ticker_hash}/{date}/{normalized_start}-{normalized_end}.json
-
-# Example:
-# User requests 10:15–11:45 → normalized to 10:00–12:00
-# User requests 10:30–11:30 → same normalized window → cache hit
-# Key: cache/abc123/2026-06-28/1000-1200.json
+tendency_score = institutional_dark_vol / (lit_vol + institutional_dark_vol)
 ```
 
-A **staging path** is used for in-progress first-time requests:
+Retail internalization volume is excluded from the denominator. This makes the score a cleaner proxy for institutional off-exchange preference rather than a mixed signal polluted by PFOF flow.
+
+#### Fallback hierarchy
+
+The enrichment S3 lookup does not always return data. The Go Lambda applies the following resolution order per ticker before returning the payload. The `tendency_confidence` field is carried in the per-symbol metadata returned alongside `buckets[]` and is surfaced in the UI.
+
+| Priority | Condition | Action | `tendency_confidence` |
+|---|---|---|---|
+| 1 | `finra-ats/latest.json` exists and ticker has ≥ 4 weekly entries | Use computed 4-week average | `"high"` |
+| 2 | `finra-ats/latest.json` exists and ticker has 1–3 weekly entries | Use partial average; note week count | `"low"` |
+| 3 | `finra-ats/latest.json` exists but ticker is absent | Ticker newly listed, illiquid, or below FINRA reporting threshold — use session-derived baseline (see below) | `"session_only"` |
+| 4 | `finra-ats/latest.json` absent entirely (fresh deploy or cron failure) | Suppress tendency score for all tickers; disable deviation coloring | `"unavailable"` |
+
+**Session-derived baseline (confidence `"session_only"`):** When no historical data exists for a ticker, the tendency score is computed from the current session itself — the institutional dark % at each clock tick is compared against the session mean up to that point rather than a historical baseline. This provides a within-session relative signal (e.g., "dark activity is spiking vs. the session average") without fabricating a historical benchmark. The detail card clearly labels this as intra-session only.
+
+**`unavailable` behavior:** Treemap cells render in a neutral grey with no deviation coloring. The leaderboard still sorts by raw institutional dark % rather than deviation. The detail card shows the stacked sparkline and running totals normally but omits the tendency comparison row and displays a banner: *"Historical baseline unavailable — FINRA data not yet loaded."*
+
+#### Cron failure detection
+
+The cron Lambda writes a `finra-ats/meta.json` manifest on each successful run:
+
+```json
+{
+  "last_updated": "2026-06-23T06:00:00Z",
+  "weeks_available": 4,
+  "ticker_count": 8742
+}
+```
+
+The aggregator Lambda reads `meta.json` on startup. If `last_updated` is more than 10 days ago, it treats the data as stale and downgrades all tickers to `confidence: "low"` regardless of week count. This surfaces a visible warning in the UI rather than silently using outdated baselines.
+
+### 3.4 Cache Design
+
+Cache keys include the bucket size so requests with different window lengths — and therefore different bucket resolutions — never share a cache entry and return mismatched `BucketMs` values.
 
 ```
-cache/{ticker_hash}/{date}/{normalized_start}-{normalized_end}/
-  staging.json     ← written incrementally during fetch
-  final.json       ← promoted from staging on completion
+cache/{ticker_hash}/{date}/{bucket_ms}/{normalized_start}-{normalized_end}.json
+
+# Examples:
+# 2hr request  → cache/abc123/2026-06-28/500/1000-1200.json
+# 6hr request  → cache/abc123/2026-06-28/5000/0900-1600.json
 ```
 
-**How cache resolution works — four scenarios:**
+Cache resolution follows the same four-scenario logic as before (full hit → partial → staging → cold). The `bucket_ms` path component is derived from the requested window length at Lambda invocation time before the cache lookup — it never changes mid-request.
 
-| Cache State | Action |
-|---|---|
-| Cache fully covers requested window | Read `final.json`, slice buckets array to match `[reqStart, reqEnd]`. Return immediately. The file stores `cached_start` and `cached_end` in metadata — slicing is a simple array range on the `buckets[]` field. Frontend gets exactly what it asked for. |
-| Cache partially covers (e.g. cached 10:00–11:00, request 10:00–12:00) | Return cached portion immediately with `{ status: "partial", cached_until: "11:00", buckets: [...] }`. Lambda starts fetching the unfilled portion (11:00–12:00) from Alpaca. Client polls for remaining data after the cached range. |
-| Staging exists (another request is already fetching) | Read whatever `staging.json` has. Return as partial. Client polls — Lambda checks staging on each poll, returns more data as it appears. No duplicate Alpaca fetch. |
-| No cache, no staging (cold request) | Start full fetch from Alpaca. Write first minute bucket to `staging.json` → return partial. Subsequent polls drain more from staging as the pipeline progresses. On completion, rename staging → final. |
+### 3.5 Data Availability Failure Modes
 
-The frontend is unaware of these details. It receives `buckets[]` and optionally a `next_token` if more data is coming. The Virtual Clock plays whatever buckets it has — new buckets are appended to the immutable ref seamlessly.
+Every external dependency has a defined degraded behavior. The system must never silently produce misleading output — every failure mode either surfaces a UI signal or falls back to a weaker-but-honest alternative.
 
-### 3.2 Incremental Response Strategy
+#### Alpaca API — no trades returned for a ticker
 
-Instead of waiting for the full dataset (~30s for 2hr window), the Lambda returns the **first minute of bucketed data immediately** (~1–2s latency). The frontend starts replaying while remaining data is still being fetched.
+The SIP feed may return zero trades for a ticker in the requested window for several legitimate reasons: pre-market or post-market request, halted stock, newly listed ticker with no history, or the ticker simply didn't trade in that window. The Lambda distinguishes these cases:
 
-The client polls with exponentially growing chunk sizes:
-
-| Poll # | Chunk | Cumulative |
+| Condition | Detection | Response |
 |---|---|---|
-| 1 (initial response) | Minute 0–1 | 1 min |
-| 2 (after ~2s) | Minutes 1–3 | 3 min |
-| 3 (after ~4s) | Minutes 3–7 | 7 min |
-| 4 (after ~8s) | Minutes 7–15 | 15 min |
-| ... | Exponential doubling | ... |
+| Ticker not found / invalid | Alpaca returns 404 or empty with no pages | Return `{ "error": "ticker_not_found" }` for that symbol; other tickers in the batch continue normally |
+| Valid ticker, zero trades in window | Empty page set returned | Return symbol with empty `buckets[]` and `{ "warn": "no_trades_in_window" }`; frontend renders cell as empty with tooltip |
+| Trading halt | Zero trades + halt condition detectable via Alpaca corporate actions endpoint | Not currently checked; treated same as zero trades; future work |
+| Alpaca API timeout (>30s) | SDK context deadline exceeded | Return partial results for completed tickers; mark timed-out tickers with `{ "error": "fetch_timeout" }` |
+| Alpaca rate limit hit (429) | Token bucket exhausted | Exponential backoff up to 3 retries within Lambda timeout; if unresolved, return partial with `{ "warn": "rate_limited", "buckets_complete": false }` |
+| Alpaca API down (5xx) | Non-retriable HTTP error | Return `{ "error": "upstream_unavailable" }` for affected tickers; logged to CloudWatch |
 
-This gets the user to **first frame in ~1–2s** instead of 30s, while the full dataset fills in progressively. The S3 cache stores the complete payload once available, so subsequent requests are instant.
+In all partial-failure cases, successfully fetched tickers are returned and replayed normally. The frontend renders failed tickers with a strikethrough label and error tooltip rather than dropping them from the treemap silently.
 
-### 3.3 Full Request Path
+#### S3 — cache read/write failures
+
+| Condition | Detection | Response |
+|---|---|---|
+| S3 GetObject 404 (no cache) | AWS SDK `NoSuchKey` error | Expected — treat as cold request, proceed to Alpaca fetch |
+| S3 GetObject failure (non-404) | AWS SDK error (network, IAM, etc.) | Log to CloudWatch; treat as cold request; do not fail the entire Lambda |
+| S3 PutObject failure (staging write) | AWS SDK error | Log and continue; incremental polling will simply return empty until a retry succeeds; cache miss on next request is acceptable |
+| Staging file corrupted / unparseable | JSON unmarshal error | Treat as cold request; overwrite staging with fresh fetch |
+| Cache entry chunk exceeds 5.5MB | Payload guard triggered | Truncate buckets array to fit; add `{ "warn": "truncated", "truncated_at": "<epoch>" }` to response; frontend displays banner |
+
+#### FINRA ATS data — gaps and staleness
+
+Covered in full in section 3.3. Summary:
+
+| Condition | `tendency_confidence` | UI Behavior |
+|---|---|---|
+| 4 weeks of data present | `"high"` | Full deviation coloring |
+| 1–3 weeks of data | `"low"` | Deviation coloring shown; badge indicates partial history |
+| Ticker absent from FINRA data | `"session_only"` | Intra-session baseline used; labeled in detail card |
+| `latest.json` absent or >10 days stale | `"unavailable"` | Deviation coloring suppressed; neutral grey; banner shown |
+
+#### Lambda — timeout with incomplete data
+
+The Lambda has a 5-minute hard timeout. For large windows (8 hours, 5 tickers), the full fetch may not complete. The incremental polling design handles this naturally: whatever buckets were written to `staging.json` before timeout are returned on the next poll with `{ "status": "partial" }`. The Lambda does not resume — the client receives what was written and the remainder is absent.
+
+The frontend detects a stalled poll (no `next_token` change after 3 consecutive polls beyond the expected window duration) and displays: *"Data collection timed out — showing partial session."* The Virtual Clock plays through the available buckets and stops rather than looping.
+
+#### Input validation failures (API Gateway)
+
+API Gateway rejects requests before Lambda invocation:
+
+| Validation | Rule | HTTP Response |
+|---|---|---|
+| Ticker count | Max 5 symbols | 400 `{ "error": "too_many_tickers" }` |
+| Ticker format | Regex `^[A-Z]{1,5}$` per symbol | 400 `{ "error": "invalid_ticker_format" }` |
+| Hours range | Integer 1–8 inclusive | 400 `{ "error": "invalid_hours" }` |
+| Missing params | `tickers` or `hours` absent | 400 `{ "error": "missing_params" }` |
+
+The frontend pre-validates the same rules client-side before firing the request, so API Gateway rejections should only occur from direct API abuse or bugs.
+
+### 3.6 Incremental Response Strategy
+
+The Lambda returns the first 30 seconds of session data immediately (~1–2s), getting the treemap rendering before the full fetch completes. Subsequent chunks grow exponentially in session-time coverage — early chunks are small so first paint is fast; later chunks are large because the user is already mid-replay and latency matters less.
+
+Chunk sizes below are in session time covered, not wall-clock poll time. Bucket count per chunk depends on the active bucket size (see section 3.2).
+
+| Poll # | Delay | Session time covered | Buckets (0.5s) | Buckets (1s) | Buckets (5s) |
+|---|---|---|---|---|---|
+| 1 (initial) | — | 0–30s | 60 | 30 | 6 |
+| 2 | ~2s | 30s–2min | 180 | 90 | 18 |
+| 3 | ~4s | 2–6min | 480 | 240 | 48 |
+| 4 | ~8s | 6–14min | 960 | 480 | 96 |
+| 5 | ~16s | 14–30min | 1,920 | 960 | 192 |
+| 6 | ~30s | 30min–1hr | 3,600 | 1,800 | 360 |
+| 7+ | ~30s (max) | Remaining | remainder | remainder | remainder |
+
+Poll delay caps at 30s. Each chunk response carries `{ "status": "partial", "next_token": "N" }` or `{ "status": "complete" }`. The Virtual Clock appends incoming buckets to its immutable ref and continues playback seamlessly — no pause or stutter at chunk boundaries.
+
+### 3.7 Full Request Path
 
 ```
 1. User selects tickers + window → React fires GET /api/replay
 
-2. Lambda builds normalized cache key from ticker hash + date +
-   hour-aligned window
+2. Lambda determines bucket size from requested window:
+   ≤2hr → 500ms | 2–4hr → 1000ms | 4–8hr → 5000ms
 
-3. S3 cache check:
+3. Lambda builds normalized cache key from ticker hash + date +
+   bucket_ms + hour-aligned window
+
+4. S3 cache check:
    a) final.json exists AND covers request → slice buckets, return
    b) staging.json exists → return what's available + next_token
    c) nothing exists → begin fetch
 
-4. SDK GetMultiTradesAsync drains to channel in background.
-   MapReduce pipeline classifies and buckets trades as they arrive.
+5. SDK GetMultiTradesAsync drains to channel in background.
+   MapReduce pipeline classifies (exchange code → sub-penny tick
+   filter → notional tier) and buckets trades into sub-minute
+   buckets as they arrive.
 
-5. Once first minute bucket is complete → write to staging.json →
-   return { status: "partial", next_token: "1", buckets: [...] }
+6. Once first 30 seconds of buckets are complete → write to
+   staging.json → return { status: "partial", next_token: "1",
+   buckets: [...60 buckets at 0.5s] }
 
-6. Client starts playback with initial buckets.
-   Polls GET /api/replay?token=1 at 2s, 4s, 8s, ... intervals.
+7. Client starts playback with initial buckets.
+   Polls GET /api/replay?token=1 at 2s, 4s, 8s, ...30s intervals.
 
-7. Lambda reads staging.json, returns remaining chunks.
-   On each poll, returns { status: "partial", next_token: "N" }
-   or { status: "complete" } when all data is returned.
+8. Lambda reads staging.json, returns exponentially growing
+   session-time chunks. Each poll returns
+   { status: "partial", next_token: "N" } or { status: "complete" }.
 
-8. On completion: staging.json → final.json (S3 copy/rename).
+9. On completion: staging.json → final.json (S3 copy/rename).
    Subsequent requests for this window → instant cache hit.
 ```
 
@@ -185,7 +360,22 @@ This gets the user to **first frame in ~1–2s** instead of 30s, while the full 
 
 ## 4. Key Architectural Decisions
 
-### 4.1 Virtual Clock vs. WebSocket
+### 4.1 Three-Way Flow Classification
+
+The naive lit/dark binary conflates two fundamentally different off-exchange populations:
+
+- **Retail internalization** (~17% of total equity volume): PFOF-driven, executed by Citadel/Virtu/Susquehanna at sub-penny improvement. No informational content about institutional positioning.
+- **Institutional dark pool prints** (~20–25% of total equity volume): Block trades and algorithm-driven large orders executed in ATSs to minimize market impact.
+
+The sub-penny tick filter cleanly separates these populations at the trade level using data already present in the SIP feed, at zero additional cost. No new data sources or API calls required.
+
+| Heuristic | Precision | Basis |
+|---|---|---|
+| Exchange code `D`/`E` | Definitive | FINRA TRF rules |
+| Sub-penny tick filter | High (known FPs: some peg orders) | FINRA best-execution rules; BJZZ (2021) |
+| Notional size tier | Indicative | SEC Rule 10b-18; industry convention |
+
+### 4.2 Virtual Clock vs. WebSocket
 
 | | WebSocket Backend | Virtual Clock (this design) |
 |---|---|---|
@@ -197,30 +387,29 @@ This gets the user to **first frame in ~1–2s** instead of 30s, while the full 
 
 For a 15-min delayed feed, WebSocket carries already-stale data. Virtual Clock achieves identical visual output at zero hosting cost.
 
-### 4.2 Go on Lambda
+### 4.3 Go on Lambda
 
 Go's fast cold start (~100ms), low memory footprint (~20MB idle), and native goroutine concurrency make it the optimal choice for processing millions of trade records across multiple tickers within Lambda's constraints. Node.js (~300ms cold start, single-threaded event loop) and Python (GIL-limited) are worse fits for this workload.
 
-### 4.3 S3 Cache + Incremental Polling
+### 4.4 S3 Cache + Incremental Polling
 
-S3 free tier (5GB, 20K GETs/month) is sufficient. Cache keys are normalized to hour boundaries so overlapping time ranges from different users hit the same cache entry. Each `final.json` stores `cached_start`/`cached_end` in its metadata — the Lambda slices the buckets array to match the exact requested window, so the frontend never sees extra data.
-
-The staging path (`.../staging.json`) prevents redundant Alpaca fetches: if two users request the same tickers near-simultaneously, the second finds existing staging, reads whatever is available, and avoids an API call. Polling uses exponential backoff (2s → 4s → 8s → 16s, max 30s) to avoid hammering the cache.
+S3 free tier (5GB, 20K GETs/month) is sufficient. Cache keys are normalized to hour boundaries so overlapping time ranges from different users hit the same cache entry. The staging path (`.../staging.json`) prevents redundant Alpaca fetches: if two users request the same tickers near-simultaneously, the second finds existing staging, reads whatever is available, and avoids an API call.
 
 Cache hits return in sub-100ms. The staging + incremental polling strategy reduces first-frame latency from ~30s to ~1–2s on cold requests.
-
-### 4.4 Minute-Level Bucketing
-
-Raw tick data for 3 tickers × 2 hours would be hundreds of MB. Aggregating to 1-minute buckets yields ~360 data points — renderable at 60fps on any device.
 
 ### 4.5 Frontend Visualization
 
 Two viewing modes:
 
-- **Treemap (default):** Canvas-rendered, GPU-accelerated. Each symbol is a cell sized by total volume, colored by dark pool % deviation from its 4-week tendency. Smooth 200ms transitions between clock ticks via `requestAnimationFrame` interpolation.
-- **Leaderboard:** Sortable list ranked by current dark pool ratio deviation. Surfaces unusual activity immediately.
+**Treemap (default):** Canvas-rendered, GPU-accelerated. Each symbol is a cell sized by total volume, colored by *institutional* dark pool % deviation from its 4-week tendency score (retail internalization excluded from both numerator and denominator). Smooth 200ms transitions between clock ticks via `requestAnimationFrame` interpolation.
 
-Clicking any symbol opens a detail card showing a sparkline of dark% over the session, running totals (lit vs dark), FINRA tendency score comparison, and an audit log of high-confidence institutional block prints.
+**Leaderboard:** Sortable list ranked by current institutional dark pool ratio deviation. Surfaces unusual block activity immediately without noise from PFOF flow.
+
+Clicking any symbol opens a detail card showing:
+- Stacked sparkline: lit (grey) / retail internalized (blue) / institutional dark (amber) / block prints (red) over the session
+- Running totals for all four flow categories
+- FINRA institutional tendency score vs. session ratio
+- Audit log of block prints (`DarkBlockVol > $10M`) with timestamp, notional, and size
 
 ---
 
@@ -249,15 +438,42 @@ Clicking any symbol opens a detail card showing a sparkline of dark% over the se
 
 ## 6. Known Constraints
 
+### Infrastructure limits
+
 | Constraint | Limit | Mitigation |
 |---|---|---|
-| API Gateway response | 10MB hard limit | Payload guard at 9MB; truncate + warning header |
-| Lambda timeout | 5 min config | Incremental response returns partial data early |
-| Alpaca rate limit | 200 req/min | Token bucket across goroutines |
+| API Gateway response | 10MB (not binding) | — |
+| Lambda response payload | 6MB hard limit (binding constraint) | Per-chunk payload guard at 5.5MB; truncate + `warn: "truncated"` header |
+| Lambda timeout | 5 min | Incremental polling returns partial data; frontend detects stall and displays banner; 5s buckets used for 4–8hr windows to keep bucket counts manageable |
+| Alpaca rate limit | 200 req/min | Token bucket across goroutines; up to 3 retries with backoff |
 | SIP feed delay | 15 min | Irrelevant for replay model |
-| S3 PUT limit | 2,000/month free | Cache stores unique combos only |
-| Dark pool classification | No retail vs institutional differentiation | Future work: microstructure-informed classifier per cited research |
+| S3 PUT limit | 2,000/month free | Cache stores normalized unique windows only |
+| S3 GET limit | 20,000/month free | Cache hit ratio reduces effective GETs; monitoring via CloudWatch |
+
+### Classification accuracy
+
+| Constraint | Impact | Mitigation |
+|---|---|---|
+| Sub-penny filter false positives | ~1–5% of institutional peg orders classified as `dark_retail` | Acceptable for visualization; noted in UI tooltip; MPID-level resolution is future work |
+| Notional tier thresholds are heuristic | Smaller hedge funds / family offices overlap with `dark_inst_small` | Tiers are labeled indicative, not definitive; thresholds documented in UI |
+| MPID-level venue identification | Not available in free SIP tier | Would allow exact wholesaler identification (Citadel, Virtu, etc.); future work |
+| Buy/sell direction | Dark pool data is post-trade; side not reported on SIP | Directional heuristic (print vs. VWAP) used in audit log; labeled as estimated |
+
+### Data availability
+
+| Condition | Affected Feature | Behavior |
+|---|---|---|
+| Ticker has no FINRA ATS history | Tendency score | Session-derived baseline used; `confidence: "session_only"` shown in detail card |
+| Ticker has < 4 weeks FINRA history | Tendency score | Partial average used; week count shown; `confidence: "low"` badge |
+| `finra-ats/latest.json` absent | Tendency score (all tickers) | Deviation coloring suppressed; neutral grey treemap; banner displayed |
+| FINRA data stale (>10 days) | Tendency score reliability | All tickers downgraded to `confidence: "low"`; staleness warning shown |
+| Ticker returns zero trades | Treemap cell | Cell rendered empty with tooltip: "No trades in window" |
+| Ticker not found on Alpaca | Treemap cell | Cell rendered with strikethrough label and `error: "ticker_not_found"` tooltip |
+| Alpaca API timeout | Partial session | Completed tickers replay normally; timed-out tickers marked with error tooltip |
+| Lambda timeout before full fetch | Session completeness | Virtual Clock plays available buckets and stops; "partial session" banner shown |
+| S3 cache write failure | Cache miss on next request | Request re-fetches from Alpaca; logged to CloudWatch; no user-visible error |
+| Corrupted staging file | Current request | Treated as cold request; staging overwritten; adds ~1–2s latency |
 
 ---
 
-*Architecture version 2.1 — June 2026*
+*Architecture version 3.3 — June 2026*
