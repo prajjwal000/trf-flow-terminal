@@ -36,7 +36,7 @@ resource "aws_iam_role_policy" "lambda_s3" {
     Version = "2012-10-17"
     Statement = [{
       Effect   = "Allow"
-      Action   = ["s3:GetObject", "s3:PutObject"]
+      Action   = ["s3:GetObject", "s3:PutObject", "s3:CopyObject"]
       Resource = "${aws_s3_bucket.cache.arn}/*"
     }]
   })
@@ -72,8 +72,9 @@ resource "aws_lambda_function" "aggregator" {
 
   environment {
     variables = {
-      APCA_API_KEY_ID    = var.alpaca_api_key
-      APCA_API_SECRET_KEY = var.alpaca_api_secret
+      APCA_API_KEY_ID     = var.APCA_API_KEY_ID
+      APCA_API_SECRET_KEY = var.APCA_API_SECRET_KEY
+      CACHE_BUCKET        = aws_s3_bucket.cache.bucket
     }
   }
 }
@@ -109,6 +110,24 @@ resource "aws_apigatewayv2_route" "health" {
   target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
 }
 
+resource "aws_apigatewayv2_route" "search" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "GET /api/search"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_route" "options" {
+  api_id    = aws_apigatewayv2_api.main.id
+  route_key = "OPTIONS /{proxy+}"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+resource "aws_apigatewayv2_stage" "default" {
+  api_id      = aws_apigatewayv2_api.main.id
+  name        = "$default"
+  auto_deploy = true
+}
+
 resource "aws_lambda_permission" "api_gw" {
   statement_id  = "AllowAPIGatewayInvoke"
   action        = "lambda:InvokeFunction"
@@ -117,7 +136,92 @@ resource "aws_lambda_permission" "api_gw" {
   source_arn    = "${aws_apigatewayv2_api.main.execution_arn}/*/*"
 }
 
+# ─── FINRA ATS Cron ────────────────────────────────────────────────────
+
 resource "aws_cloudwatch_event_rule" "finra_cron" {
   name_prefix         = "trf-flow-finra-"
   schedule_expression = "cron(0 6 ? * MON *)"
+}
+
+resource "aws_iam_role" "finra_lambda" {
+  name_prefix = "trf-flow-finra-lambda-"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "finra_lambda_s3" {
+  name_prefix = "trf-flow-finra-lambda-s3-"
+  role        = aws_iam_role.finra_lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["s3:GetObject", "s3:PutObject"]
+      Resource = "${aws_s3_bucket.cache.arn}/finra-ats/*"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "finra_lambda_logs" {
+  name_prefix = "trf-flow-finra-lambda-logs-"
+  role        = aws_iam_role.finra_lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ]
+      Resource = "arn:aws:logs:*:*:*"
+    }]
+  })
+}
+
+data "archive_file" "finra_cron" {
+  type        = "zip"
+  source_dir  = "${path.module}/../backend/bin/finra-cron"
+  output_path = "${path.module}/.terraform/finra-cron.zip"
+}
+
+resource "aws_lambda_function" "finra_cron" {
+  filename         = data.archive_file.finra_cron.output_path
+  source_code_hash = data.archive_file.finra_cron.output_base64sha256
+  function_name    = "trf-flow-finra-cron"
+  role             = aws_iam_role.finra_lambda.arn
+  handler          = "bootstrap"
+  runtime          = "provided.al2"
+  memory_size      = 128
+  timeout          = 120
+
+  environment {
+    variables = {
+      CACHE_BUCKET = aws_s3_bucket.cache.bucket
+    }
+  }
+}
+
+resource "aws_lambda_permission" "finra_cron" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.finra_cron.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.finra_cron.arn
+}
+
+resource "aws_cloudwatch_event_target" "finra_cron" {
+  rule  = aws_cloudwatch_event_rule.finra_cron.name
+  arn   = aws_lambda_function.finra_cron.arn
 }

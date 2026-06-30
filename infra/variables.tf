@@ -1,9 +1,9 @@
-variable "alpaca_api_key" {
+variable "APCA_API_KEY_ID" {
   type      = string
   sensitive = true
 }
 
-variable "alpaca_api_secret" {
+variable "APCA_API_SECRET_KEY" {
   type      = string
   sensitive = true
 }

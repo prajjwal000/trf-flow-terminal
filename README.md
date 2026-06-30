@@ -64,7 +64,7 @@ FINRA ATS weekly reports are ingested via cron Lambda and stored in S3. Each sym
 │  └─────────────────────────┘    └───────────────────────────────┘   │
 └──────────────────────┬───────────────────────────────────────────────┘
                        │
-                       │  GET /api/replay?tickers=AAPL,SPY,NVDA&hours=2
+                        │  GET /api/replay?tickers=AAPL,SPY,NVDA&start=2026-06-30T09:30:00Z&end=2026-06-30T11:30:00Z
                        ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │                       GATEWAY LAYER                                  │
@@ -162,19 +162,11 @@ func classifyTrade(t Trade) FlowClass {
 }
 ```
 
-### 3.2 Bucket Schema and Adaptive Resolution
+### 3.2 Bucket Schema
 
-Buckets are sub-minute to make the Virtual Clock replay feel fluid. The bucket size is selected at request time based on the requested window, keeping the total bucket count — and therefore chunk sizes and payload — manageable regardless of session length:
+Buckets are fixed at 0.5 seconds for all window lengths, keeping the Virtual Clock replay fluid at any speed. At 10x speed, this produces ~20 renders per second. A full 8-hour session generates 57,600 buckets per ticker, which is well within the 5.5MB per-chunk payload guard (see section 5).
 
-| Window | Bucket size | Buckets per hour | Buckets per max window |
-|---|---|---|---|
-| ≤ 2 hours | 0.5 seconds | 7,200 | 14,400 |
-| 2–4 hours | 1 second | 3,600 | 14,400 |
-| 4–8 hours | 5 seconds | 720 | 23,040 |
-
-The bucket size is determined once at the start of the Lambda invocation and held constant for all tickers in the request. It is included in the cache key (see section 3.4) so different window lengths never share cache entries.
-
-Each bucket carries five volume fields. The frontend consumes all five; the treemap coloring and tendency score use only the institutional fields.
+Bucket size is fixed at 500ms (0.5 seconds). Each bucket carries five volume fields.
 
 ```go
 type Bucket struct {
@@ -231,17 +223,23 @@ The aggregator Lambda reads `meta.json` on startup. If `last_updated` is more th
 
 ### 3.4 Cache Design
 
-Cache keys include the bucket size so requests with different window lengths — and therefore different bucket resolutions — never share a cache entry and return mismatched `BucketMs` values.
+Bucket size is fixed at 500ms, so `bucket_ms` is always `500`. The cache key is based on the sorted ticker hash so overlapping requests for the same tickers share cache paths:
 
 ```
-cache/{ticker_hash}/{date}/{bucket_ms}/{normalized_start}-{normalized_end}.json
+cache/{ticker_hash}/{date}/{bucket_ms}/{window_start}-{window_end}/
+├── chunks/{offset}.json     # Individual incremental fetch chunks
+├── meta.json                # { fetched_offsets: [...], complete: bool }
+└── final.json               # Assembled full result (exists when complete)
 
-# Examples:
-# 2hr request  → cache/abc123/2026-06-28/500/1000-1200.json
-# 6hr request  → cache/abc123/2026-06-28/5000/0900-1600.json
+# Example:
+# cache/abc123/2026-06-28/500/093000-133000/
+#   ├── chunks/000000.json   (offset 0, covers 0–30s)
+#   ├── chunks/000030.json   (offset 30, covers 30–90s)
+#   ├── meta.json
+#   └── final.json
 ```
 
-Cache resolution follows the same four-scenario logic as before (full hit → partial → staging → cold). The `bucket_ms` path component is derived from the requested window length at Lambda invocation time before the cache lookup — it never changes mid-request.
+Chunks grow exponentially: the first request fetches 30 seconds of data, the second 60 seconds, then 120, 240, etc. Each chunk is offset-based (seconds from the window start) and stored independently. When all offsets are fetched, the chunks are assembled into `final.json` and subsequent requests return instantly.
 
 ### 3.5 Data Availability Failure Modes
 
@@ -294,66 +292,74 @@ The frontend detects a stalled poll (no `next_token` change after 3 consecutive 
 API Gateway rejects requests before Lambda invocation:
 
 | Validation | Rule | HTTP Response |
-|---|---|---|
+|---|---|---|---|
 | Ticker count | Max 5 symbols | 400 `{ "error": "too_many_tickers" }` |
 | Ticker format | Regex `^[A-Z]{1,5}$` per symbol | 400 `{ "error": "invalid_ticker_format" }` |
-| Hours range | Integer 1–8 inclusive | 400 `{ "error": "invalid_hours" }` |
-| Missing params | `tickers` or `hours` absent | 400 `{ "error": "missing_params" }` |
+| Start/End range | Window 1–8 hours; start must be before end | 400 `{ "error": "invalid_window" }` |
+| Missing params | `tickers`, `start`, or `end` absent | 400 `{ "error": "missing_params" }` |
 
 The frontend pre-validates the same rules client-side before firing the request, so API Gateway rejections should only occur from direct API abuse or bugs.
 
 ### 3.6 Incremental Response Strategy
 
-The Lambda returns the first 30 seconds of session data immediately (~1–2s), getting the treemap rendering before the full fetch completes. Subsequent chunks grow exponentially in session-time coverage — early chunks are small so first paint is fast; later chunks are large because the user is already mid-replay and latency matters less.
+The first request returns data immediately (~1–2s), getting the treemap rendering before the full session fetch completes. Each request fetches a single chunk from the session window, growing exponentially in size. Chunks never overlap — each Lambda invocation fetches the exact time range it needs and terminates.
 
-Chunk sizes below are in session time covered, not wall-clock poll time. Bucket count per chunk depends on the active bucket size (see section 3.2).
+**Chunk size formula:** `chunk_seconds = max(30, offset * 2)` where `offset` is seconds from the window start already covered.
 
-| Poll # | Delay | Session time covered | Buckets (0.5s) | Buckets (1s) | Buckets (5s) |
+| Poll # | Offset | Chunk size | Session covered | Cumulative | Buckets (0.5s) |
 |---|---|---|---|---|---|
-| 1 (initial) | — | 0–30s | 60 | 30 | 6 |
-| 2 | ~2s | 30s–2min | 180 | 90 | 18 |
-| 3 | ~4s | 2–6min | 480 | 240 | 48 |
-| 4 | ~8s | 6–14min | 960 | 480 | 96 |
-| 5 | ~16s | 14–30min | 1,920 | 960 | 192 |
-| 6 | ~30s | 30min–1hr | 3,600 | 1,800 | 360 |
-| 7+ | ~30s (max) | Remaining | remainder | remainder | remainder |
+| 1 | 0s | 30s | 0–30s | 30s | 60 |
+| 2 | 30s | 60s | 30s–90s | 90s | 120 |
+| 3 | 90s | 180s | 90s–270s | 4.5min | 360 |
+| 4 | 270s | 540s | 270s–810s | 13.5min | 1,080 |
+| 5 | 810s | 1,620s | 810s–2,430s | 40.5min | 3,240 |
+| 6+ | doubling | doubling | — | — | — |
 
-Poll delay caps at 30s. Each chunk response carries `{ "status": "partial", "next_token": "N" }` or `{ "status": "complete" }`. The Virtual Clock appends incoming buckets to its immutable ref and continues playback seamlessly — no pause or stutter at chunk boundaries.
+**Client polling (exponential backoff):** The first poll arrives 5s after the initial response, then 10s, 20s, capping at 30s. This gives each Lambda enough time to write its chunk to S3 cache before the next poll arrives.
+
+| Poll # | Client delay | Cumulative wall time |
+|---|---|---|
+| 1 (initial) | — | t+0 |
+| 2 | 5s | t+5s |
+| 3 | 10s | t+15s |
+| 4 | 20s | t+35s |
+| 5+ | 30s cap | t+65s... |
+
+Each chunk response carries `{ "status": "partial", "next_offset": N }` or `{ "status": "complete" }`. The Virtual Clock appends incoming buckets seamlessly — no pause or stutter at chunk boundaries. When all chunks are fetched, they're assembled into `final.json` in S3 and subsequent requests for the same window return instantly.
+
+**Payload guard:** If a response exceeds 5.5MB, buckets are truncated proportionally and `"warn": "truncated"` is added to the response. The frontend displays a banner: *"Data truncated due to payload size limit — showing partial session."*
 
 ### 3.7 Full Request Path
 
 ```
-1. User selects tickers + window → React fires GET /api/replay
+1. User selects tickers + window → React fires GET /api/replay?offset=0
 
-2. Lambda determines bucket size from requested window:
-   ≤2hr → 500ms | 2–4hr → 1000ms | 4–8hr → 5000ms
+2. Lambda computes chunk size: chunk_sec = max(30, offset * 2)
+   First request (offset=0): chunk = 30s of session data.
 
-3. Lambda builds normalized cache key from ticker hash + date +
-   bucket_ms + hour-aligned window
+3. S3 cache check:
+   a) final.json exists → return entire cached response, done
+   b) chunks/{offset}.json exists → return cached chunk (previous
+      Lambda already fetched this range), done
+   c) nothing exists → fetch from Alpaca
 
-4. S3 cache check:
-   a) final.json exists AND covers request → slice buckets, return
-   b) staging.json exists → return what's available + next_token
-   c) nothing exists → begin fetch
+4. Lambda fetches trades from Alpaca SIP for [start+offset,
+   start+offset+chunk_sec). Classifies each trade (exchange code →
+   sub-penny tick filter → notional tier). Buckets at 0.5s resolution.
 
-5. SDK GetMultiTradesAsync drains to channel in background.
-   MapReduce pipeline classifies (exchange code → sub-penny tick
-   filter → notional tier) and buckets trades into sub-minute
-   buckets as they arrive.
+5. Lambda writes chunk to S3: chunks/{offset}.json. Updates meta.json.
 
-6. Once first 30 seconds of buckets are complete → write to
-   staging.json → return { status: "partial", next_token: "1",
-   buckets: [...60 buckets at 0.5s] }
+6. If this completes the full window (offset + chunk_sec ≥ total),
+   Lambda assembles all chunks into final.json and subsequent
+   requests return instantly.
 
-7. Client starts playback with initial buckets.
-   Polls GET /api/replay?token=1 at 2s, 4s, 8s, ...30s intervals.
+7. Lambda returns { status: "partial"|"complete", symbols: [...],
+   next_offset: offset+chunk_sec }.
 
-8. Lambda reads staging.json, returns exponentially growing
-   session-time chunks. Each poll returns
-   { status: "partial", next_token: "N" } or { status: "complete" }.
+8. Client takes ownership of returned buckets, appends to
+   VirtualClock, and schedules next poll at 5s → 10s → 20s → 30s.
 
-9. On completion: staging.json → final.json (S3 copy/rename).
-   Subsequent requests for this window → instant cache hit.
+9. Next poll: repeat from step 2 with updated offset.
 ```
 
 ---
@@ -432,7 +438,7 @@ Clicking any symbol opens a detail card showing:
 - Alpaca credentials: Lambda environment variables only, never committed
 - CORS: locked to Netlify production domain; localhost permitted in dev via env var
 - IAM: Lambda role has `s3:GetObject` + `s3:PutObject` on cache path only
-- API Gateway validates `tickers` (max 5, regex) and `hours` (1–8) before invoking Lambda
+- API Gateway validates `tickers` (max 5, regex), `start` and `end` (ISO8601, window 1–8h) before invoking Lambda
 
 ---
 
@@ -443,8 +449,8 @@ Clicking any symbol opens a detail card showing:
 | Constraint | Limit | Mitigation |
 |---|---|---|
 | API Gateway response | 10MB (not binding) | — |
-| Lambda response payload | 6MB hard limit (binding constraint) | Per-chunk payload guard at 5.5MB; truncate + `warn: "truncated"` header |
-| Lambda timeout | 5 min | Incremental polling returns partial data; frontend detects stall and displays banner; 5s buckets used for 4–8hr windows to keep bucket counts manageable |
+| Lambda response payload | 6MB hard limit (binding constraint) | Per-chunk payload guard at 5.5MB; truncate + `warn: "truncated"` field |
+| Lambda timeout | 5 min | Incremental polling fetches small chunks first; exponential growth means most requests finish within seconds; large windows may timeout but partial data is returned |
 | Alpaca rate limit | 200 req/min | Token bucket across goroutines; up to 3 retries with backoff |
 | SIP feed delay | 15 min | Irrelevant for replay model |
 | S3 PUT limit | 2,000/month free | Cache stores normalized unique windows only |
