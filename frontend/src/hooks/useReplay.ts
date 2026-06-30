@@ -22,7 +22,7 @@ interface UseReplayReturn {
 }
 
 const POLL_DELAYS = [5000, 10000, 20000, 30000]
-const MAX_POLLS = 10
+const MAX_POLLS = 400
 
 export function useReplay({ tickers, start, end }: UseReplayOptions): UseReplayReturn {
   const [symbols, setSymbols] = useState<SymbolResult[]>([])

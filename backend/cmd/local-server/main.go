@@ -64,6 +64,12 @@ func ensureAssetCache() {
 		return
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("asset fetch returned status %d", resp.StatusCode)
+		return
+	}
+
 	body, _ := io.ReadAll(resp.Body)
 
 	type Asset struct {
@@ -183,7 +189,7 @@ func main() {
 
 		bucketMs := bucket.SelectSize()
 
-		chunkSec := max(30, offset*2)
+		chunkSec := max(30, min(offset, 90))
 		fetchStart := start.Add(time.Duration(offset) * time.Second)
 		fetchEnd := fetchStart.Add(time.Duration(chunkSec) * time.Second)
 		if fetchEnd.After(end) {

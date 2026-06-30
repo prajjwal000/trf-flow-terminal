@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from "react"
 import { searchTickersOnline, type TickerResult } from "@/lib/api"
+import { searchTickers as searchTickersLocal } from "@/lib/tickers"
 import { X, Loader2 } from "lucide-react"
 
 interface TickerSearchProps {
@@ -24,7 +25,11 @@ export function TickerSearch({ selected, onChange }: TickerSearchProps) {
     setLoading(true)
     clearTimeout(debounceRef.current)
     debounceRef.current = setTimeout(async () => {
-      const res = await searchTickersOnline(query)
+      let res = await searchTickersOnline(query)
+      if (res.length === 0) {
+        const local = searchTickersLocal(query)
+        res = local.map((t) => ({ symbol: t.symbol, name: t.name, exchange: "" }))
+      }
       setResults(res.filter((t) => !selected.includes(t.symbol)))
       setLoading(false)
     }, 200)

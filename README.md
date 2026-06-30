@@ -302,18 +302,18 @@ The frontend pre-validates the same rules client-side before firing the request,
 
 ### 3.6 Incremental Response Strategy
 
-The first request returns data immediately (~1–2s), getting the treemap rendering before the full session fetch completes. Each request fetches a single chunk from the session window, growing exponentially in size. Chunks never overlap — each Lambda invocation fetches the exact time range it needs and terminates.
+The first request returns data immediately (~1–2s), getting the treemap rendering before the full session fetch completes. Each request fetches a single chunk from the session window, growing gradually in size up to a cap of 90s. Chunks never overlap — each Lambda invocation fetches the exact time range it needs and terminates.
 
-**Chunk size formula:** `chunk_seconds = max(30, offset * 2)` where `offset` is seconds from the window start already covered.
+**Chunk size formula:** `chunk_seconds = max(30, min(offset, 90))` where `offset` is seconds from the window start already covered. This caps each fetch at 90 seconds of data, keeping Lambda duration well under API Gateway's 30-second integration timeout.
 
 | Poll # | Offset | Chunk size | Session covered | Cumulative | Buckets (0.5s) |
 |---|---|---|---|---|---|
 | 1 | 0s | 30s | 0–30s | 30s | 60 |
-| 2 | 30s | 60s | 30s–90s | 90s | 120 |
-| 3 | 90s | 180s | 90s–270s | 4.5min | 360 |
-| 4 | 270s | 540s | 270s–810s | 13.5min | 1,080 |
-| 5 | 810s | 1,620s | 810s–2,430s | 40.5min | 3,240 |
-| 6+ | doubling | doubling | — | — | — |
+| 2 | 30s | 30s | 30s–60s | 60s | 60 |
+| 3 | 60s | 60s | 60s–120s | 2min | 120 |
+| 4 | 120s | 90s | 120s–210s | 3.5min | 180 |
+| 5 | 210s | 90s | 210s–300s | 5min | 180 |
+| 6+ | 90s increments | 90s | — | — | — |
 
 **Client polling (exponential backoff):** The first poll arrives 5s after the initial response, then 10s, 20s, capping at 30s. This gives each Lambda enough time to write its chunk to S3 cache before the next poll arrives.
 
@@ -334,7 +334,7 @@ Each chunk response carries `{ "status": "partial", "next_offset": N }` or `{ "s
 ```
 1. User selects tickers + window → React fires GET /api/replay?offset=0
 
-2. Lambda computes chunk size: chunk_sec = max(30, offset * 2)
+2. Lambda computes chunk size: chunk_sec = max(30, min(offset, 90))
    First request (offset=0): chunk = 30s of session data.
 
 3. S3 cache check:

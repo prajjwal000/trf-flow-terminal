@@ -94,6 +94,11 @@ func ensureAssetCache(ctx context.Context) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("asset fetch returned status %d", resp.StatusCode)
+		return
+	}
+
 	body, _ := io.ReadAll(resp.Body)
 	type Asset struct {
 		Symbol   string `json:"symbol"`
@@ -188,7 +193,7 @@ func handleReplay(ctx context.Context, req events.APIGatewayV2HTTPRequest) event
 	log.Printf("replay: %v [%s – %s] offset=%d bucketMs=%d", tickers, startRaw, endRaw, offset, bucketMs)
 
 	totalSec := int(end.Sub(start).Seconds())
-	chunkSec := max(30, min(offset*2, 600))
+	chunkSec := max(30, min(offset, 90))
 	fetchStart := start.Add(time.Duration(offset) * time.Second)
 	fetchEnd := fetchStart.Add(time.Duration(chunkSec) * time.Second)
 	if fetchEnd.After(end) {
@@ -396,7 +401,7 @@ func max(a, b int) int {
 }
 
 func chunkSize(offset int) int {
-	return max(30, min(offset*2, 600))
+	return max(30, min(offset, 90))
 }
 
 func classifyAndBucket(tickers []string, trades map[string][]marketdata.Trade, bucketMs int64) []SymbolResult {
